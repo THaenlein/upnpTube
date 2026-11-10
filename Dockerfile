@@ -1,13 +1,12 @@
-FROM alpine:3.17
+FROM node:26-alpine
 
-RUN apk add --no-cache \
-    git \
-    npm \
-    yt-dlp
+RUN apk add --no-cache yt-dlp git
 
-RUN git clone https://github.com/mas94uk/upnpTube /tmp/upnpTube \
-    && cd /tmp/upnpTube \
-    && npm ci \
-    && npm link
+WORKDIR /app
 
-ENTRYPOINT [ "node", "/usr/local/bin/upnpTube" ]
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --allow-git=all
+
+COPY index.js renderer.js ssdp.js ./
+
+ENTRYPOINT [ "node", "index.js" ]

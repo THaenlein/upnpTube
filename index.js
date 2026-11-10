@@ -1,4 +1,4 @@
-#!/bin/node
+#!/usr/bin/env node
 
 // Configuration
 const DISCOVERY_PERIOD = 600; // Re-scan for upnp devices every 10m

@@ -1,9 +1,7 @@
-version: '3'
-
 services:
   upnpTube:
     container_name: upnp-tube
-    image: mas94uk/upnp-tube
+    image: localhost/upnp-tube:latest
     network_mode: 'host'
     build:
       context: './'  # folder containing the Dockerfile

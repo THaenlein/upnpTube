@@ -37,7 +37,20 @@ Clone this repository:
 Create and start the Docker image:
 
     cd upnpTube
-    docker-compose up [--detach]
+    podman compose up [--detach]
+
+### Firewall
+
+The YouTube app fetches the DIAL device description and sends commands to the
+cast receiver, and the DLNA renderer fetches the audio stream from the proxy.
+Both need inbound TCP access to the host. With `ufw` (default policy `DROP`),
+discovery over SSDP still works because ufw allows multicast on UDP 1900, but
+the device is then hidden from the cast list because the description request is
+dropped. Allow the cast receiver (`3000+index`) and proxy (`8000+index`) ports
+from the local network:
+
+    sudo ufw allow from <LAN subnet> to any port 3000:3099 proto tcp
+    sudo ufw allow from <LAN subnet> to any port 8000:8099 proto tcp
 
 ### How it works
 upnpTube scans for DLNA/UPNP renderers on your network. For each one it finds, it creates a YouTube Cast Receiver, named after the renderer.

@@ -1,6 +1,7 @@
 const { Console } = require('console');
 const MediaRendererClient = require('upnp-mediarenderer-client');
 const { exec } = require('child_process');
+const net = require('net');
 const os = require('os');
 const httpProxy = require('http-proxy');
 
@@ -12,6 +13,40 @@ const YTCR_BASE_PORT = 3000;
 
 // Use port 800n for the HTTPS->HTTP proxying of the media
 const PROXY_BASE_PORT = 8000;
+
+/**
+ * Convert a dotted IPv4 address to an unsigned 32-bit integer.
+ */
+function ipv4ToInt(address) {
+    return address.split('.').reduce((result, octet) => ((result << 8) + Number(octet)) >>> 0, 0);
+}
+
+/**
+ * Find the local IPv4 address that is in the same subnet as the remote host.
+ * Renderers must be able to reach the proxy, so URLs cannot use os.hostname(),
+ * which usually only resolves on this machine itself.
+ */
+function localAddressFor(remoteHost) {
+    const target = net.isIPv4(remoteHost) ? ipv4ToInt(remoteHost) : null;
+    var fallback = null;
+
+    for (const addresses of Object.values(os.networkInterfaces())) {
+        for (const address of addresses || []) {
+            if (address.family !== 'IPv4' || address.internal) continue;
+
+            if (fallback === null) fallback = address.address;
+
+            if (target !== null) {
+                const mask = ipv4ToInt(address.netmask);
+                if ((target & mask) === (ipv4ToInt(address.address) & mask)) {
+                    return address.address;
+                }
+            }
+        }
+    }
+
+    return fallback;
+}
 
 // TODO Does this clean up nicely? YTCR instance disappear from the menu in the youtube app? Port freed etc?
 
@@ -171,9 +206,15 @@ class Renderer extends Ytcr.Player {
             obj.proxy = httpProxy.createProxyServer(proxyOptions);
             obj.proxy.listen(proxyPort);
 
-            // Create a URL to give to the renderer with the same path and params, but starting http://our-hostname:port
-            const hostname = os.hostname();
-            const rendererUrl = `http://${hostname}:${proxyPort}/${url.pathname}${url.search}`;
+            // Create a URL to give to the renderer with the same path and params,
+            // but served by our proxy on the interface that can reach the renderer
+            const rendererHost = new URL(obj.location).hostname;
+            const proxyHost = localAddressFor(rendererHost);
+            if (!proxyHost) {
+                console.log(`[${obj.friendlyName}]: Unable to determine local address for proxy`);
+                return;
+            }
+            const rendererUrl = `http://${proxyHost}:${proxyPort}/${url.pathname}${url.search}`;
 
             // Load and play the URL on the renderer
             const options = { autoplay: true,

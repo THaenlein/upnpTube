@@ -1,6 +1,6 @@
 FROM node:26-alpine
 
-RUN apk add --no-cache yt-dlp git
+RUN apk add --no-cache yt-dlp ffmpeg git
 
 WORKDIR /app
 

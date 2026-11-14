@@ -20,9 +20,9 @@ Install upnpTube:
     npm install https://github.com/mas94uk/upnpTube
     sudo npm link
     
-Install yt-dlp:
+Install yt-dlp and ffmpeg:
 
-    sudo apt install yt-dlp
+    sudo apt install yt-dlp ffmpeg
 
 Run it:
 
@@ -54,9 +54,12 @@ from the local network:
 
 ### How it works
 upnpTube scans for DLNA/UPNP renderers on your network. For each one it finds, it creates a YouTube Cast Receiver, named after the renderer.
-When a YouTube Cast Receiver receives a cast, it uses yt-dlp to find an audio-only stream, which it proxies (since it will be available as HTTPS and most renderers support only HTTP). It instructs the renderer to play the proxied stream.
+When a YouTube Cast Receiver receives a cast, it uses yt-dlp to find an audio-only stream, which it remuxes to ADTS AAC with ffmpeg (since YouTube serves fragmented MP4 and HTTPS, which many renderers do not support) and serves over HTTP to the renderer.
 
 
 ### Limitations
 
 Seeking does not work. I have not done much investigation into why.
+
+The stream is remuxed on the fly, so its length is unknown: renderers
+report a duration of 0 and the YouTube app cannot show a progress bar.

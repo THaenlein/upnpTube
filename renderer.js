@@ -1,9 +1,11 @@
 const { Console } = require('console');
 const MediaRendererClient = require('upnp-mediarenderer-client');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
+const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const net = require('net');
 const os = require('os');
-const httpProxy = require('http-proxy');
 
 // TODO: Ideally the author will accept the pull request and re-publish. Otherwise tie it to my fork.
 const Ytcr = require('yt-cast-receiver');
@@ -13,6 +15,13 @@ const YTCR_BASE_PORT = 3000;
 
 // Use port 800n for the HTTPS->HTTP proxying of the media
 const PROXY_BASE_PORT = 8000;
+
+// How often the media proxy follows a redirect from googlevideo before it
+// gives up on one attempt (the chains are routinely two to three hops long),
+// how many attempts it makes in total, and how long it waits between them.
+const MAX_MEDIA_REDIRECTS = 8;
+const MAX_MEDIA_ATTEMPTS = 3;
+const MEDIA_RETRY_DELAY = 500;
 
 /**
  * Convert a dotted IPv4 address to an unsigned 32-bit integer.
@@ -48,6 +57,104 @@ function localAddressFor(remoteHost) {
     return fallback;
 }
 
+/**
+ * Address family to connect with for a signed googlevideo URL.
+ * googlevideo URLs are locked to the IP address that requested them, so we
+ * must use the same address family (IPv4 or IPv6) that yt-dlp used.
+ * Returns 0 when the URL carries no IP.
+ */
+function addressFamilyOf(url) {
+    const signedIp = url.searchParams.get('ip');
+    return net.isIPv4(signedIp) ? 4 : net.isIPv6(signedIp) ? 6 : 0;
+}
+
+/**
+ * Fetch a signed googlevideo URL and follow its redirects.
+ *
+ * `hops` collects "status@host" entries so a failure can name the server that
+ * rejected the request. The callback gets either an error or a readable
+ * upstream response.
+ */
+function followMediaRedirects(url, hops, redirectsLeft, callback) {
+    const options = { headers: { range: 'bytes=0-' } };
+    const family = addressFamilyOf(url);
+    if (family) options.family = family;
+
+    // Redirect targets are still https in practice, but honour the scheme.
+    const client = url.protocol === 'http:' ? http : https;
+
+    const request = client.get(url, options, function(response) {
+        const status = response.statusCode;
+        const location = response.headers.location;
+        hops.push(`${status}@${url.hostname}`);
+
+        if (status >= 300 && status < 400 && location) {
+            response.resume();
+
+            if (redirectsLeft <= 0) {
+                callback(new Error(`redirected too often (${hops.join(' ')})`));
+                return;
+            }
+
+            followMediaRedirects(new URL(location, url), hops, redirectsLeft - 1, callback);
+            return;
+        }
+
+        if (status !== 200 && status !== 206) {
+            // googlevideo explains rejects in the body; keep a short excerpt.
+            let body = '';
+            let reported = false;
+            const fail = function() {
+                if (reported) return;
+                reported = true;
+                const detail = body.replace(/\s+/g, ' ').slice(0, 200);
+                callback(new Error(`media server returned ${status} (${hops.join(' ')})${detail ? ': ' + detail : ''}`));
+            };
+
+            response.setEncoding('utf8');
+            response.on('data', function(chunk) {
+                if (body.length < 200) body += chunk;
+            });
+            response.on('end', fail);
+            response.on('error', fail);
+            return;
+        }
+
+        callback(null, response);
+    });
+
+    request.on('error', function(err) {
+        callback(err);
+    });
+}
+
+/**
+ * Open the media stream behind a signed googlevideo URL.
+ *
+ * googlevideo answers with a redirect to a freshly signed URL on another edge
+ * server, and an edge that does not carry the stream answers 403. Both are
+ * per-request conditions, so a normal player follows the redirect and simply
+ * asks again. Without this the renderer gets no audio at all.
+ */
+function openMediaStream(url, attemptsLeft, callback) {
+    followMediaRedirects(url, [], MAX_MEDIA_REDIRECTS, function(err, response) {
+        if (!err) {
+            callback(null, response);
+            return;
+        }
+
+        if (attemptsLeft <= 1) {
+            callback(err);
+            return;
+        }
+
+        console.log(`Media attempt failed: ${err.message}. Retrying...`);
+        setTimeout(function() {
+            openMediaStream(url, attemptsLeft - 1, callback);
+        }, MEDIA_RETRY_DELAY);
+    });
+}
+
 // TODO Does this clean up nicely? YTCR instance disappear from the menu in the youtube app? Port freed etc?
 
 /**
@@ -66,6 +173,8 @@ class Renderer extends Ytcr.Player {
         this.index = index;
         this.timeout = timeout;
         this.httpServer = null;
+        this.stream = null;
+        this.streamServer = null;
         this.refresh();
 
         // Instantiate the mediarender client
@@ -179,6 +288,84 @@ class Renderer extends Ytcr.Player {
     }
 
     /**
+     * Create the HTTP server that serves the audio stream to the renderer.
+     * It is reused for every track.
+     */
+    ensureStreamServer() {
+        if (this.streamServer) return;
+
+        const obj = this;
+        this.streamServer = http.createServer(function(req, res) {
+            obj.serveStream(req, res);
+        });
+        this.streamServer.on('error', function(err) {
+            console.log(`[${obj.friendlyName}]: Stream server error: ${err.message}`);
+        });
+        this.streamServer.listen(PROXY_BASE_PORT + this.index);
+    }
+
+    /**
+     * Serve the current track to the renderer.
+     *
+     * Renderers such as the Panasonic soundbar truncate request URIs at 1024
+     * bytes, so the long signed googlevideo URL cannot be handed to them
+     * directly (they would request a truncated URL and Google would answer
+     * 403). The renderer gets a short token instead, which we expand here.
+     *
+     * Some renderers (again the Panasonic) cannot play the fragmented MP4
+     * (DASH) stream that YouTube serves either. ffmpeg remuxes it to ADTS AAC
+     * on the fly, which those devices do accept.
+     */
+    serveStream(req, res) {
+        const obj = this;
+        const token = req.url.split('?')[0].replace(/^\/+/, '');
+        const stream = this.stream;
+
+        if (!stream || token !== stream.token) {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+
+        openMediaStream(stream.url, MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
+            if (err) {
+                console.log(`[${obj.friendlyName}]: Media request error: ${err.message}`);
+                res.writeHead(502);
+                res.end();
+                return;
+            }
+
+            const ffmpeg = spawn('ffmpeg', ['-loglevel', 'error', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'adts', 'pipe:1']);
+
+            res.writeHead(200, { 'Content-Type': 'audio/aac' });
+            upstreamRes.pipe(ffmpeg.stdin);
+            ffmpeg.stdout.pipe(res);
+
+            // Writing to a closed pipe must not crash the process.
+            ffmpeg.stdin.on('error', function() {});
+
+            ffmpeg.stderr.on('data', function(data) {
+                console.log(`[${obj.friendlyName}]: ffmpeg: ${data.toString().trim()}`);
+            });
+
+            ffmpeg.on('error', function(err) {
+                console.log(`[${obj.friendlyName}]: Unable to run ffmpeg: ${err.message}`);
+                upstreamRes.destroy();
+                res.end();
+            });
+
+            ffmpeg.on('close', function() {
+                res.end();
+            });
+
+            req.on('close', function() {
+                upstreamRes.destroy();
+                ffmpeg.kill();
+            });
+        });
+    }
+
+    /**
      * The methods implementing yt-cast-receiver.Player
      */
     async play(videoId, position = 0) {
@@ -186,39 +373,32 @@ class Renderer extends Ytcr.Player {
         const obj = this;
 
         this.getAudioUrl(videoId, function(audioUrl) {
-            const url = new URL(audioUrl);
-
-            // Stop the existing proxy (if there is one)
-            if(obj.proxy) {
-                obj.proxy.close();
+            if (!audioUrl) {
+                console.log(`[${obj.friendlyName}]: No audio URL`);
+                return;
             }
 
-            // Create an HTTP -> HTTPS proxy, allowing the renderer to retrieve the file over HTTP
-            const proxyPort = PROXY_BASE_PORT + obj.index;
-            const proxyOptions = {
-                target: {
-                    protocol: url.protocol,
-                    host: url.host,
-                    port: url.port || 443
-                },
-                changeOrigin: true
-            };
-            obj.proxy = httpProxy.createProxyServer(proxyOptions);
-            obj.proxy.listen(proxyPort);
+            const url = new URL(audioUrl);
 
-            // Create a URL to give to the renderer with the same path and params,
-            // but served by our proxy on the interface that can reach the renderer
+            // Create a URL to give to the renderer, served by our proxy on the
+            // interface that can reach the renderer.
             const rendererHost = new URL(obj.location).hostname;
             const proxyHost = localAddressFor(rendererHost);
             if (!proxyHost) {
                 console.log(`[${obj.friendlyName}]: Unable to determine local address for proxy`);
                 return;
             }
-            const rendererUrl = `http://${proxyHost}:${proxyPort}/${url.pathname}${url.search}`;
+
+            const token = crypto.randomBytes(8).toString('hex');
+            obj.stream = { token: token, url: url };
+            obj.ensureStreamServer();
+
+            const proxyPort = PROXY_BASE_PORT + obj.index;
+            const rendererUrl = `http://${proxyHost}:${proxyPort}/${token}`;
 
             // Load and play the URL on the renderer
             const options = { autoplay: true,
-                                contentType: 'audio/mp4' };
+                                contentType: 'audio/aac' };
             obj.client.load(rendererUrl, options, function(err, result) {
                 if(err) {
                     console.log(`[${obj.friendlyName}]: Error loading media:`)

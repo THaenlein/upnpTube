@@ -18,10 +18,14 @@ const PROXY_BASE_PORT = 8000;
 
 // How often the media proxy follows a redirect from googlevideo before it
 // gives up on one attempt (the chains are routinely two to three hops long),
-// how many attempts it makes in total, and how long it waits between them.
+// how many attempts it makes in total, how long it waits between them, how
+// long it waits for an edge to answer, and how long it tolerates silence
+// while the stream is running.
 const MAX_MEDIA_REDIRECTS = 8;
 const MAX_MEDIA_ATTEMPTS = 3;
 const MEDIA_RETRY_DELAY = 500;
+const MEDIA_CONNECT_TIMEOUT = 10000;
+const MEDIA_IDLE_TIMEOUT = 15000;
 
 /**
  * Convert a dotted IPv4 address to an unsigned 32-bit integer.
@@ -76,12 +80,24 @@ function addressFamilyOf(url) {
  * upstream response.
  */
 function followMediaRedirects(url, hops, redirectsLeft, callback) {
-    const options = { headers: { range: 'bytes=0-' } };
+    const options = {
+        headers: { range: 'bytes=0-' },
+        timeout: MEDIA_CONNECT_TIMEOUT
+    };
     const family = addressFamilyOf(url);
     if (family) options.family = family;
 
     // Redirect targets are still https in practice, but honour the scheme.
     const client = url.protocol === 'http:' ? http : https;
+
+    // A destroy() fires 'error' as well, and a response error after we already
+    // handed the stream out must not call the callback a second time.
+    let settled = false;
+    const finish = function(err, response) {
+        if (settled) return;
+        settled = true;
+        callback(err, response);
+    };
 
     const request = client.get(url, options, function(response) {
         const status = response.statusCode;
@@ -92,23 +108,20 @@ function followMediaRedirects(url, hops, redirectsLeft, callback) {
             response.resume();
 
             if (redirectsLeft <= 0) {
-                callback(new Error(`redirected too often (${hops.join(' ')})`));
+                finish(new Error(`redirected too often (${hops.join(' ')})`));
                 return;
             }
 
-            followMediaRedirects(new URL(location, url), hops, redirectsLeft - 1, callback);
+            followMediaRedirects(new URL(location, url), hops, redirectsLeft - 1, finish);
             return;
         }
 
         if (status !== 200 && status !== 206) {
             // googlevideo explains rejects in the body; keep a short excerpt.
             let body = '';
-            let reported = false;
             const fail = function() {
-                if (reported) return;
-                reported = true;
                 const detail = body.replace(/\s+/g, ' ').slice(0, 200);
-                callback(new Error(`media server returned ${status} (${hops.join(' ')})${detail ? ': ' + detail : ''}`));
+                finish(new Error(`media server returned ${status} (${hops.join(' ')})${detail ? ': ' + detail : ''}`));
             };
 
             response.setEncoding('utf8');
@@ -120,39 +133,18 @@ function followMediaRedirects(url, hops, redirectsLeft, callback) {
             return;
         }
 
-        callback(null, response);
+        // The body is consumed by the caller, which applies its own idle
+        // timeout. The socket timeout must not fire while it streams.
+        request.setTimeout(0);
+        finish(null, response);
     });
 
-    request.on('error', function(err) {
-        callback(err);
+    request.on('timeout', function() {
+        const trail = hops.length ? ` (${hops.join(' ')})` : '';
+        request.destroy(new Error(`no answer from ${url.hostname} within ${MEDIA_CONNECT_TIMEOUT}ms${trail}`));
     });
-}
 
-/**
- * Open the media stream behind a signed googlevideo URL.
- *
- * googlevideo answers with a redirect to a freshly signed URL on another edge
- * server, and an edge that does not carry the stream answers 403. Both are
- * per-request conditions, so a normal player follows the redirect and simply
- * asks again. Without this the renderer gets no audio at all.
- */
-function openMediaStream(url, attemptsLeft, callback) {
-    followMediaRedirects(url, [], MAX_MEDIA_REDIRECTS, function(err, response) {
-        if (!err) {
-            callback(null, response);
-            return;
-        }
-
-        if (attemptsLeft <= 1) {
-            callback(err);
-            return;
-        }
-
-        console.log(`Media attempt failed: ${err.message}. Retrying...`);
-        setTimeout(function() {
-            openMediaStream(url, attemptsLeft - 1, callback);
-        }, MEDIA_RETRY_DELAY);
-    });
+    request.on('error', finish);
 }
 
 // TODO Does this clean up nicely? YTCR instance disappear from the menu in the youtube app? Port freed etc?
@@ -242,6 +234,10 @@ class Renderer extends Ytcr.Player {
         return false;
     }
 
+    /**
+     * Resolve the audio URL of a video with yt-dlp.
+     * The callback always fires: with the URL, or with null when both tools failed.
+     */
     getAudioUrl(videoId, callback) {
         const obj = this;
 
@@ -270,6 +266,7 @@ class Renderer extends Ytcr.Player {
                         // if(stderr) {
                         //     console.log(stderr);
                         // }
+                        callback(null);
                     } else {
                         // Call the callback with the retrieved URL
                         const audioUrl = stdout.toString().trim();
@@ -284,6 +281,51 @@ class Renderer extends Ytcr.Player {
                 console.log(`[${obj.friendlyName}]: Media URL: ${audioUrl}`);
                 callback(audioUrl);
             }
+        });
+    }
+
+    /**
+     * Open the media stream for the current track.
+     *
+     * googlevideo answers with a redirect to a freshly signed URL on another
+     * edge server, and an edge that does not carry the stream answers 403.
+     * Asking the same URL again cannot repair that: the URL is bound to the
+     * client IP address and to the edge that signed it. So each attempt that
+     * fails resolves a fresh URL with yt-dlp first.
+     */
+    openStream(attemptsLeft, callback) {
+        const obj = this;
+        const stream = this.stream;
+
+        followMediaRedirects(stream.url, [], MAX_MEDIA_REDIRECTS, function(err, response) {
+            if (!err) {
+                callback(null, response);
+                return;
+            }
+
+            if (attemptsLeft <= 1) {
+                callback(err);
+                return;
+            }
+
+            console.log(`[${obj.friendlyName}]: Media attempt failed: ${err.message}. Resolving a fresh URL...`);
+
+            setTimeout(function() {
+                if (obj.stream !== stream) {
+                    callback(new Error('track changed while resolving a fresh URL'));
+                    return;
+                }
+
+                obj.getAudioUrl(stream.videoId, function(audioUrl) {
+                    if (!audioUrl) {
+                        callback(new Error('unable to resolve a fresh audio URL'));
+                        return;
+                    }
+
+                    stream.url = new URL(audioUrl);
+                    obj.openStream(attemptsLeft - 1, callback);
+                });
+            }, MEDIA_RETRY_DELAY);
         });
     }
 
@@ -327,7 +369,7 @@ class Renderer extends Ytcr.Player {
             return;
         }
 
-        openMediaStream(stream.url, MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
+        this.openStream(MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
             if (err) {
                 console.log(`[${obj.friendlyName}]: Media request error: ${err.message}`);
                 res.writeHead(502);
@@ -336,6 +378,38 @@ class Renderer extends Ytcr.Player {
             }
 
             const ffmpeg = spawn('ffmpeg', ['-loglevel', 'error', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'adts', 'pipe:1']);
+
+            let received = 0;
+            let sent = 0;
+
+            // A stalled upstream would otherwise look like a working stream
+            // until the renderer decides on its own that playback is over.
+            upstreamRes.setTimeout(MEDIA_IDLE_TIMEOUT, function() {
+                upstreamRes.destroy(new Error(`nothing received for ${MEDIA_IDLE_TIMEOUT}ms`));
+            });
+
+            upstreamRes.on('data', function(chunk) {
+                received += chunk.length;
+            });
+
+            upstreamRes.on('end', function() {
+                const expected = Number(upstreamRes.headers['content-length'] || 0);
+                console.log(`[${obj.friendlyName}]: Upstream ended after ${received} bytes` +
+                            (expected && received < expected ? ` of ${expected} (truncated)` : ''));
+            });
+
+            upstreamRes.on('error', function(err) {
+                console.log(`[${obj.friendlyName}]: Media stream failed after ${received} bytes: ${err.message}`);
+                ffmpeg.stdin.end();
+            });
+
+            ffmpeg.stdout.on('data', function(chunk) {
+                sent += chunk.length;
+            });
+
+            res.on('error', function(err) {
+                console.log(`[${obj.friendlyName}]: Renderer connection error: ${err.message}`);
+            });
 
             res.writeHead(200, { 'Content-Type': 'audio/aac' });
             upstreamRes.pipe(ffmpeg.stdin);
@@ -355,6 +429,7 @@ class Renderer extends Ytcr.Player {
             });
 
             ffmpeg.on('close', function() {
+                console.log(`[${obj.friendlyName}]: Media stream closed, ${received} bytes in, ${sent} bytes out`);
                 res.end();
             });
 
@@ -390,11 +465,12 @@ class Renderer extends Ytcr.Player {
             }
 
             const token = crypto.randomBytes(8).toString('hex');
-            obj.stream = { token: token, url: url };
+            obj.stream = { token: token, url: url, videoId: videoId };
             obj.ensureStreamServer();
 
             const proxyPort = PROXY_BASE_PORT + obj.index;
             const rendererUrl = `http://${proxyHost}:${proxyPort}/${token}`;
+            console.log(`[${obj.friendlyName}]: Streaming via ${rendererUrl}`);
 
             // Load and play the URL on the renderer
             const options = { autoplay: true,

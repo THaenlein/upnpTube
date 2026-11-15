@@ -1,6 +1,6 @@
 const { Console } = require('console');
 const MediaRendererClient = require('upnp-mediarenderer-client');
-const { exec, spawn } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
@@ -10,6 +10,38 @@ const os = require('os');
 // TODO: Ideally the author will accept the pull request and re-publish. Otherwise tie it to my fork.
 const Ytcr = require('yt-cast-receiver');
 
+// YouTube senders expect the DIAL app state to name the screenId they paired
+// with. The pinned receiver exposes screenId but does not publish it through
+// peer-dial's additionalData hook, so the sender sees a running app without
+// its screenId and treats the app as stopped.
+const YouTubeApp = require('yt-cast-receiver/lib/app');
+if (!Object.getOwnPropertyDescriptor(YouTubeApp.prototype, 'additionalData')) {
+    Object.defineProperty(YouTubeApp.prototype, 'additionalData', {
+        get: function() {
+            console.log(`[${this.screenName}]: DIAL screenId ${this.screenId || '(none)'}`);
+            return this.screenId ? { screenId: this.screenId } : undefined;
+        }
+    });
+}
+
+// The pinned receiver advertises the same lounge device ID on every host.
+// YouTube's lounge then has two screens with one identity, and the sender can
+// drop the session after a few seconds. Derive a stable valid UUID per host.
+const announcementId = crypto.createHash('sha1').update(os.hostname()).digest('hex');
+const SCREEN_UID = [
+    announcementId.slice(0, 8),
+    announcementId.slice(8, 12),
+    '5' + announcementId.slice(13, 16),
+    '8' + announcementId.slice(17, 20),
+    announcementId.slice(20, 32)
+].join('-');
+const getAnnouncementTemplate = YouTubeApp.prototype._getAnnouncementTemplate;
+YouTubeApp.prototype._getAnnouncementTemplate = function() {
+    const template = getAnnouncementTemplate.call(this);
+    template.id = SCREEN_UID;
+    return template;
+};
+
 // Use ports 3000, 3001, 3002 etc for successive YTCRs
 const YTCR_BASE_PORT = 3000;
 
@@ -18,14 +50,22 @@ const PROXY_BASE_PORT = 8000;
 
 // How often the media proxy follows a redirect from googlevideo before it
 // gives up on one attempt (the chains are routinely two to three hops long),
-// how many attempts it makes in total, how long it waits between them, how
-// long it waits for an edge to answer, and how long it tolerates silence
+// how many fresh URLs it resolves in total, how long it waits between them,
+// how often and how long it retries a URL that is not yet valid at the edge,
+// how long it waits for an edge to answer, and how long it tolerates silence
 // while the stream is running.
 const MAX_MEDIA_REDIRECTS = 8;
 const MAX_MEDIA_ATTEMPTS = 3;
 const MEDIA_RETRY_DELAY = 500;
+const MEDIA_URL_SETTLE_ATTEMPTS = 5;
+const MEDIA_URL_SETTLE_DELAY = 500;
 const MEDIA_CONNECT_TIMEOUT = 10000;
 const MEDIA_IDLE_TIMEOUT = 15000;
+
+// googlevideo signs its URLs for the client address that requested them.
+// Resolve the initial URL over IPv4, which is available on every LAN and does
+// not depend on the host's IPv6 routing; the retry path falls back to IPv6.
+const PREFERRED_MEDIA_ADDRESS_FAMILY = 4;
 
 /**
  * Convert a dotted IPv4 address to an unsigned 32-bit integer.
@@ -73,19 +113,47 @@ function addressFamilyOf(url) {
 }
 
 /**
+ * Whether an IP address belongs to one of this host's interfaces.
+ * An IPv4 media URL names the public NAT address, which is not local; an IPv6
+ * URL normally names the address itself, so we can bind to it.
+ */
+function isLocalAddress(candidate) {
+    for (const addresses of Object.values(os.networkInterfaces())) {
+        for (const address of addresses || []) {
+            if (address.address === candidate) return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Fetch a signed googlevideo URL and follow its redirects.
  *
  * `hops` collects "status@host" entries so a failure can name the server that
  * rejected the request. The callback gets either an error or a readable
  * upstream response.
  */
-function followMediaRedirects(url, hops, redirectsLeft, callback) {
+function followMediaRedirects(url, family, hops, redirectsLeft, callback, settleAttemptsLeft = MEDIA_URL_SETTLE_ATTEMPTS, originalUrl = null) {
+    // Redirect targets can point at an edge that rejects the URL outright.
+    // Retrying the URL that yt-dlp signed lets the load balancer pick another
+    // edge, while still following a target that happens to be usable.
+    const retryUrl = originalUrl || url;
+
     const options = {
         headers: { range: 'bytes=0-' },
         timeout: MEDIA_CONNECT_TIMEOUT
     };
-    const family = addressFamilyOf(url);
+
+    // Redirect targets may lose the `ip` parameter, but they are still bound
+    // to the family of the URL that was signed. Carry it through the chain.
+    family = family || addressFamilyOf(url);
     if (family) options.family = family;
+
+    // googlevideo rejects a signed URL when it is fetched from another address
+    // than the one in its `ip` parameter.
+    const signedIp = url.searchParams.get('ip');
+    if (signedIp && isLocalAddress(signedIp)) options.localAddress = signedIp;
 
     // Redirect targets are still https in practice, but honour the scheme.
     const client = url.protocol === 'http:' ? http : https;
@@ -102,7 +170,8 @@ function followMediaRedirects(url, hops, redirectsLeft, callback) {
     const request = client.get(url, options, function(response) {
         const status = response.statusCode;
         const location = response.headers.location;
-        hops.push(`${status}@${url.hostname}`);
+        const hop = `${status}@${url.hostname}`;
+        if (hops[hops.length - 1] !== hop) hops.push(hop);
 
         if (status >= 300 && status < 400 && location) {
             response.resume();
@@ -112,7 +181,7 @@ function followMediaRedirects(url, hops, redirectsLeft, callback) {
                 return;
             }
 
-            followMediaRedirects(new URL(location, url), hops, redirectsLeft - 1, finish);
+            followMediaRedirects(new URL(location, url), family, hops, redirectsLeft - 1, finish, settleAttemptsLeft, retryUrl);
             return;
         }
 
@@ -120,6 +189,20 @@ function followMediaRedirects(url, hops, redirectsLeft, callback) {
             // googlevideo explains rejects in the body; keep a short excerpt.
             let body = '';
             const fail = function() {
+                // A signed URL answers 403 until it reaches the serving edge,
+                // and 503 while that edge is not ready. Retry the original URL:
+                // a redirect target can be a permanently rejected edge while
+                // the original URL becomes usable.
+                if ((status === 403 || status === 503) && settleAttemptsLeft > 1) {
+                    if (settled) return;
+                    settled = true;
+
+                    setTimeout(function() {
+                        followMediaRedirects(retryUrl, family, hops, redirectsLeft, callback, settleAttemptsLeft - 1, retryUrl);
+                    }, MEDIA_URL_SETTLE_DELAY);
+                    return;
+                }
+
                 const detail = body.replace(/\s+/g, ' ').slice(0, 200);
                 finish(new Error(`media server returned ${status} (${hops.join(' ')})${detail ? ': ' + detail : ''}`));
             };
@@ -166,6 +249,7 @@ class Renderer extends Ytcr.Player {
         this.timeout = timeout;
         this.httpServer = null;
         this.stream = null;
+        this.playGeneration = 0;
         this.streamServer = null;
         this.refresh();
 
@@ -203,10 +287,12 @@ class Renderer extends Ytcr.Player {
             // });
 
             // Create a youtube cast receiver
+            const dialAddress = localAddressFor(new URL(obj.location).hostname);
             const options = {port: YTCR_BASE_PORT + obj.index,
                              friendlyName: obj.friendlyName,
                              manufacturer: description.manufacturer,
-                             modelName: description.modelName}; 
+                             modelName: description.modelName,
+                             bindToAddresses: dialAddress ? [dialAddress] : undefined}; 
             obj.ytcr = Ytcr.instance(obj, options);
             obj.ytcr.start();
 
@@ -236,51 +322,50 @@ class Renderer extends Ytcr.Player {
 
     /**
      * Resolve the audio URL of a video with yt-dlp.
-     * The callback always fires: with the URL, or with null when both tools failed.
+     *
+     * `family` is 4 or 6 to sign the URL for that address family, or 0 to let
+     * yt-dlp choose. The callback always fires: with the URL, or with null
+     * when both tools failed.
      */
-    getAudioUrl(videoId, callback) {
+    getAudioUrl(videoId, family, callback) {
         const obj = this;
+        const args = ['-f', 'bestaudio[ext=m4a]', '--get-url'];
+        if (family === 4) args.unshift('-4');
+        else if (family === 6) args.unshift('-6');
+        args.push(`https://www.youtube.com/watch?v=${videoId}`);
 
-        // Call yt-dlp to get the audio URL
-        exec(`yt-dlp -f bestaudio[ext=m4a] --get-url https://www.youtube.com/watch?v=${videoId}`, function(err, stdout, stderr) {
-            if(err) {
-                console.log(`[${obj.friendlyName}]: Unable to get audio URL using yt-dlp. Using youtube-dl but this is slower!`);
+        const report = function(audioUrl) {
+            console.log(`[${obj.friendlyName}]: Media URL: ${audioUrl}`);
+            callback(audioUrl);
+        };
 
-                // Enable to see what went wrong
-                // console.log(err);
-                // if(stdout) {
-                //     console.log(stdout);
-                // }
-                // if(stderr) {
-                //     console.log(stderr);
-                // }
-
-                exec(`youtube-dl -f bestaudio[ext=m4a] --get-url https://www.youtube.com/watch?v=${videoId}`, function(err, stdout, stderr) {
-                    if(err) {
-                        console.log(`[${obj.friendlyName}]: Error getting URL from youtube-dl:`);
-                        // Enable to see what went wrong
-                        // console.log(err);
-                        // if(stdout) {
-                        //     console.log(stdout);
-                        // }
-                        // if(stderr) {
-                        //     console.log(stderr);
-                        // }
-                        callback(null);
-                    } else {
-                        // Call the callback with the retrieved URL
-                        const audioUrl = stdout.toString().trim();
-                        console.log(`[${obj.friendlyName}]: Media URL: ${audioUrl}`);
-                        callback(audioUrl);
-                    }
-                });
+        const fallback = function() {
+            // An explicitly requested family may be unavailable on this host;
+            // let yt-dlp choose before giving up.
+            if (family) {
+                obj.getAudioUrl(videoId, 0, callback);
+            } else {
+                callback(null);
             }
-            else {
-                // Call the callback with the retrieved URL
+        };
+
+        execFile('yt-dlp', args, function(err, stdout) {
+            const audioUrl = stdout.toString().trim();
+            if (!err && audioUrl) {
+                report(audioUrl);
+                return;
+            }
+
+            console.log(`[${obj.friendlyName}]: Unable to get audio URL using yt-dlp. Using youtube-dl but this is slower!`);
+            execFile('youtube-dl', args, function(err, stdout) {
                 const audioUrl = stdout.toString().trim();
-                console.log(`[${obj.friendlyName}]: Media URL: ${audioUrl}`);
-                callback(audioUrl);
-            }
+                if (!err && audioUrl) {
+                    report(audioUrl);
+                } else {
+                    console.log(`[${obj.friendlyName}]: Error getting URL from youtube-dl`);
+                    fallback();
+                }
+            });
         });
     }
 
@@ -289,16 +374,24 @@ class Renderer extends Ytcr.Player {
      *
      * googlevideo answers with a redirect to a freshly signed URL on another
      * edge server, and an edge that does not carry the stream answers 403.
-     * Asking the same URL again cannot repair that: the URL is bound to the
-     * client IP address and to the edge that signed it. So each attempt that
-     * fails resolves a fresh URL with yt-dlp first.
+     * A signed URL is also rejected until it reaches the serving edge: 403
+     * until it is accepted, 503 while that edge is not ready. followMediaRedirects
+     * retries those statuses a few times before the URL is abandoned. A
+     * rejected redirect target sends the retry back to the original URL, so a
+     * dead target does not pin the request to one edge. If that still fails,
+     * resolve a fresh URL with yt-dlp, switching between IPv4 and IPv6 so a
+     * broken or rejected address family does not block playback.
      */
     openStream(attemptsLeft, callback) {
         const obj = this;
         const stream = this.stream;
+        const started = Date.now();
 
-        followMediaRedirects(stream.url, [], MAX_MEDIA_REDIRECTS, function(err, response) {
+        console.log(`[${obj.friendlyName}]: Opening upstream ${stream.url.hostname}`);
+
+        followMediaRedirects(stream.url, 0, [], MAX_MEDIA_REDIRECTS, function(err, response) {
             if (!err) {
+                console.log(`[${obj.friendlyName}]: Upstream open after ${Date.now() - started}ms`);
                 callback(null, response);
                 return;
             }
@@ -316,7 +409,8 @@ class Renderer extends Ytcr.Player {
                     return;
                 }
 
-                obj.getAudioUrl(stream.videoId, function(audioUrl) {
+                const retryFamily = addressFamilyOf(stream.url) === 6 ? 4 : 6;
+                obj.getAudioUrl(stream.videoId, retryFamily, function(audioUrl) {
                     if (!audioUrl) {
                         callback(new Error('unable to resolve a fresh audio URL'));
                         return;
@@ -343,6 +437,9 @@ class Renderer extends Ytcr.Player {
         this.streamServer.on('error', function(err) {
             console.log(`[${obj.friendlyName}]: Stream server error: ${err.message}`);
         });
+        this.streamServer.on('listening', function() {
+            console.log(`[${obj.friendlyName}]: Stream server listening on port ${PROXY_BASE_PORT + obj.index}`);
+        });
         this.streamServer.listen(PROXY_BASE_PORT + this.index);
     }
 
@@ -357,48 +454,81 @@ class Renderer extends Ytcr.Player {
      * Some renderers (again the Panasonic) cannot play the fragmented MP4
      * (DASH) stream that YouTube serves either. ffmpeg remuxes it to ADTS AAC
      * on the fly, which those devices do accept.
+     *
+     * The 200 headers go out before the stream is attached. `play` normally
+     * opens the upstream before `client.load` and hands it over here, because
+     * the soundbar stops if the URL stays silent for a few seconds while
+     * googlevideo rejects a freshly signed URL.
      */
     serveStream(req, res) {
         const obj = this;
         const token = req.url.split('?')[0].replace(/^\/+/, '');
         const stream = this.stream;
 
+        const requestStarted = Date.now();
+        console.log(`[${obj.friendlyName}]: Proxy ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
+
         if (!stream || token !== stream.token) {
+            console.log(`[${obj.friendlyName}]: Proxy token ${token} does not match ${stream ? stream.token : '(no stream)'}`);
             res.writeHead(404);
             res.end();
             return;
         }
 
-        this.openStream(MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
-            if (err) {
-                console.log(`[${obj.friendlyName}]: Media request error: ${err.message}`);
-                res.writeHead(502);
-                res.end();
+        let upstream = null;
+        let ffmpeg = null;
+        let closed = false;
+
+        // The renderer starts its playback clock when it receives the response
+        // headers. Do not wait for the signed URL here: googlevideo answers 403
+        // or 503 until the URL reaches the serving edge, and the soundbar gives
+        // up if the headers take longer than a few seconds.
+        res.writeHead(200, { 'Content-Type': 'audio/aac' });
+        res.flushHeaders();
+
+        const shutdown = function() {
+            console.log(`[${obj.friendlyName}]: Proxy response closed after ${Date.now() - requestStarted}ms` +
+                        (res.writableFinished ? ' (finished)' : ''));
+            if (res.writableFinished) return;
+            closed = true;
+            if (upstream) upstream.destroy();
+            if (ffmpeg) ffmpeg.kill();
+        };
+
+        res.on('close', shutdown);
+        res.on('error', function(err) {
+            console.log(`[${obj.friendlyName}]: Renderer connection error: ${err.message}`);
+        });
+
+        const startStream = function(upstreamRes) {
+            if (closed) {
+                upstreamRes.destroy();
                 return;
             }
 
-            const ffmpeg = spawn('ffmpeg', ['-loglevel', 'error', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'adts', 'pipe:1']);
+            upstream = upstreamRes;
+            ffmpeg = spawn('ffmpeg', ['-loglevel', 'error', '-i', 'pipe:0', '-c:a', 'copy', '-f', 'adts', 'pipe:1']);
 
             let received = 0;
             let sent = 0;
 
             // A stalled upstream would otherwise look like a working stream
             // until the renderer decides on its own that playback is over.
-            upstreamRes.setTimeout(MEDIA_IDLE_TIMEOUT, function() {
-                upstreamRes.destroy(new Error(`nothing received for ${MEDIA_IDLE_TIMEOUT}ms`));
+            upstream.setTimeout(MEDIA_IDLE_TIMEOUT, function() {
+                upstream.destroy(new Error(`nothing received for ${MEDIA_IDLE_TIMEOUT}ms`));
             });
 
-            upstreamRes.on('data', function(chunk) {
+            upstream.on('data', function(chunk) {
                 received += chunk.length;
             });
 
-            upstreamRes.on('end', function() {
-                const expected = Number(upstreamRes.headers['content-length'] || 0);
+            upstream.on('end', function() {
+                const expected = Number(upstream.headers['content-length'] || 0);
                 console.log(`[${obj.friendlyName}]: Upstream ended after ${received} bytes` +
                             (expected && received < expected ? ` of ${expected} (truncated)` : ''));
             });
 
-            upstreamRes.on('error', function(err) {
+            upstream.on('error', function(err) {
                 console.log(`[${obj.friendlyName}]: Media stream failed after ${received} bytes: ${err.message}`);
                 ffmpeg.stdin.end();
             });
@@ -407,12 +537,7 @@ class Renderer extends Ytcr.Player {
                 sent += chunk.length;
             });
 
-            res.on('error', function(err) {
-                console.log(`[${obj.friendlyName}]: Renderer connection error: ${err.message}`);
-            });
-
-            res.writeHead(200, { 'Content-Type': 'audio/aac' });
-            upstreamRes.pipe(ffmpeg.stdin);
+            upstream.pipe(ffmpeg.stdin);
             ffmpeg.stdout.pipe(res);
 
             // Writing to a closed pipe must not crash the process.
@@ -424,19 +549,31 @@ class Renderer extends Ytcr.Player {
 
             ffmpeg.on('error', function(err) {
                 console.log(`[${obj.friendlyName}]: Unable to run ffmpeg: ${err.message}`);
-                upstreamRes.destroy();
-                res.end();
+                upstream.destroy();
+                if (!closed) res.end();
             });
 
             ffmpeg.on('close', function() {
                 console.log(`[${obj.friendlyName}]: Media stream closed, ${received} bytes in, ${sent} bytes out`);
-                res.end();
+                if (!closed) res.end();
             });
+        };
 
-            req.on('close', function() {
-                upstreamRes.destroy();
-                ffmpeg.kill();
-            });
+        if (stream.upstream) {
+            const ready = stream.upstream;
+            stream.upstream = null;
+            startStream(ready);
+            return;
+        }
+
+        this.openStream(MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
+            if (err) {
+                console.log(`[${obj.friendlyName}]: Media request error: ${err.message}`);
+                if (!closed) res.end();
+                return;
+            }
+
+            startStream(upstreamRes);
         });
     }
 
@@ -446,8 +583,12 @@ class Renderer extends Ytcr.Player {
     async play(videoId, position = 0) {
         console.log(`[${this.friendlyName}]: Play ${videoId} at position ${position}s`);
         const obj = this;
+        const generation = ++this.playGeneration;
 
-        this.getAudioUrl(videoId, function(audioUrl) {
+        this.getAudioUrl(videoId, PREFERRED_MEDIA_ADDRESS_FAMILY, function(audioUrl) {
+            // Stop or another play can happen while yt-dlp is resolving.
+            if (generation !== obj.playGeneration) return;
+
             if (!audioUrl) {
                 console.log(`[${obj.friendlyName}]: No audio URL`);
                 return;
@@ -464,25 +605,57 @@ class Renderer extends Ytcr.Player {
                 return;
             }
 
+            if (obj.stream && obj.stream.upstream) {
+                obj.stream.upstream.destroy();
+            }
+
             const token = crypto.randomBytes(8).toString('hex');
-            obj.stream = { token: token, url: url, videoId: videoId };
+            const stream = { token: token, url: url, videoId: videoId };
+            obj.stream = stream;
             obj.ensureStreamServer();
 
             const proxyPort = PROXY_BASE_PORT + obj.index;
             const rendererUrl = `http://${proxyHost}:${proxyPort}/${token}`;
             console.log(`[${obj.friendlyName}]: Streaming via ${rendererUrl}`);
 
-            // Load and play the URL on the renderer
-            const options = { autoplay: true,
-                                contentType: 'audio/aac' };
-            obj.client.load(rendererUrl, options, function(err, result) {
-                if(err) {
-                    console.log(`[${obj.friendlyName}]: Error loading media:`)
-                    console.log(err);
+            const load = function() {
+                // Load and play the URL on the renderer
+                const options = { autoplay: true,
+                                    contentType: 'audio/aac' };
+                console.log(`[${obj.friendlyName}]: Loading ${rendererUrl}`);
+                obj.client.load(rendererUrl, options, function(err, result) {
+                    if(err) {
+                        console.log(`[${obj.friendlyName}]: Error loading media:`)
+                        console.log(err);
+                        if (stream.upstream) {
+                            stream.upstream.destroy();
+                            stream.upstream = null;
+                        }
+                    }
+                    else {
+                        obj.notifyPlayed();
+                    }
+                });
+            };
+
+            // Open the media before telling the renderer to play. The soundbar
+            // stops if the URL stays silent for a few seconds, which happens
+            // while googlevideo rejects a freshly signed URL.
+            console.log(`[${obj.friendlyName}]: Preparing media`);
+            obj.openStream(MAX_MEDIA_ATTEMPTS, function(err, upstreamRes) {
+                if (generation !== obj.playGeneration || obj.stream !== stream) {
+                    if (upstreamRes) upstreamRes.destroy();
+                    return;
                 }
-                else {
-                    obj.notifyPlayed();
+
+                if (err) {
+                    console.log(`[${obj.friendlyName}]: Unable to prepare media: ${err.message}`);
+                } else {
+                    stream.upstream = upstreamRes;
+                    console.log(`[${obj.friendlyName}]: Media ready`);
                 }
+
+                load();
             });
         });
     }
@@ -526,7 +699,14 @@ class Renderer extends Ytcr.Player {
     async stop() {
         console.log(`[${this.friendlyName}]: Stop`);
         const obj = this;
-        
+
+        if (this.stream && this.stream.upstream) {
+            this.stream.upstream.destroy();
+            this.stream.upstream = null;
+        }
+        this.stream = null;
+        this.playGeneration += 1;
+
         // Stop the dlna renderer
         this.client.stop(function(err, result) {
             if (err) {
@@ -620,6 +800,17 @@ class Renderer extends Ytcr.Player {
 
     async getDuration() {
         console.log(`[${this.friendlyName}]: getDuration`);
+
+        // The renderer reports duration 0 because the proxy stream has no
+        // length. The signed URL carries the real duration, which the sender
+        // needs for its nowPlaying state.
+        if (this.stream) {
+            const duration = Number(this.stream.url.searchParams.get('dur'));
+            if (Number.isFinite(duration) && duration > 0) {
+                console.log(`[${this.friendlyName}]: getDuration ${duration} (media URL)`);
+                return duration;
+            }
+        }
 
         const obj = this;
 

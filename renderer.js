@@ -251,6 +251,9 @@ class Renderer extends Ytcr.Player {
         this.stream = null;
         this.playGeneration = 0;
         this.streamServer = null;
+        this.volume = null;
+        this.position = 0;
+        this.duration = 0;
         this.refresh();
 
         // Instantiate the mediarender client
@@ -743,20 +746,19 @@ class Renderer extends Ytcr.Player {
         console.log(`[${this.friendlyName}]: getVolume`);
         const obj = this;
 
-        const promise = new Promise(function(resolve, reject) {
+        return new Promise(function(resolve) {
             obj.client.getVolume(function(err, result) {
                 if(err) {
-                    console.log(`[${obj.friendlyName}]: getVolume error:`);
+                    console.log(`[${obj.friendlyName}]: getVolume error, using last known volume ${obj.volume}:`);
                     console.log(err);
-                    reject(err);
+                    resolve(obj.volume === null ? 0 : obj.volume);
                 } else {
+                    obj.volume = result;
                     console.log(`[${obj.friendlyName}]: getVolume ${result}`);
                     resolve(result);
                 }
             })
         });
-
-        return promise;
     }
 
     async setVolume(volume) {
@@ -782,20 +784,19 @@ class Renderer extends Ytcr.Player {
 
         const obj = this;
 
-        const promise = new Promise(function(resolve, reject) {
+        return new Promise(function(resolve) {
             obj.client.getPosition(function(err, result) {
                 if(err) {
-                    console.log(`[${obj.friendlyName}]: getPosition error:`);
+                    console.log(`[${obj.friendlyName}]: getPosition error, using last known position ${obj.position}:`);
                     console.log(err);
-                    reject(err);
+                    resolve(obj.position);
                 } else {
+                    obj.position = result;
                     console.log(`[${obj.friendlyName}]: getPosition ${result}`);
                     resolve(result);
                 }
             })
         });
-
-        return promise;
     }
 
     async getDuration() {
@@ -807,6 +808,7 @@ class Renderer extends Ytcr.Player {
         if (this.stream) {
             const duration = Number(this.stream.url.searchParams.get('dur'));
             if (Number.isFinite(duration) && duration > 0) {
+                this.duration = duration;
                 console.log(`[${this.friendlyName}]: getDuration ${duration} (media URL)`);
                 return duration;
             }
@@ -814,20 +816,19 @@ class Renderer extends Ytcr.Player {
 
         const obj = this;
 
-        const promise = new Promise(function(resolve, reject) {
+        return new Promise(function(resolve) {
             obj.client.getDuration(function(err, result) {
                 if(err) {
-                    console.log(`[${obj.friendlyName}]: getDuration error:`);
+                    console.log(`[${obj.friendlyName}]: getDuration error, using last known duration ${obj.duration}:`);
                     console.log(err);
-                    reject(err);
+                    resolve(obj.duration);
                 } else {
+                    obj.duration = result;
                     console.log(`[${obj.friendlyName}]: getDuration ${result}`);
                     resolve(result);
                 }
             })
         });
-
-        return promise;
     }
 }
 
